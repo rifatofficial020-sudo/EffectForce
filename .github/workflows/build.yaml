@@ -1,0 +1,94 @@
+
+name: EffectForce - Windows x64 Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    name: Build EffectForce (Windows 64-bit)
+    runs-on: windows-latest
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      # Checkout source code
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Enable long Windows paths
+      - name: Configure Git
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+
+      # Install Rust
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      # Cargo cache
+      - name: Cache Rust Dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x64-effectforce
+
+      # Check Rust version
+      - name: Check Rust Version
+        run: rustc --version
+
+      # Check project
+      - name: Check EffectForce
+        run: cargo check --release -p effectcraft
+
+      # Build Windows x64
+      - name: Build EffectForce
+        run: cargo build --release -p effectcraft --target x86_64-pc-windows-msvc
+
+      # Prepare output
+      - name: Prepare Windows Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $binary = "target/x86_64-pc-windows-msvc/release/effectcraft.exe"
+
+          if (!(Test-Path $binary)) {
+              throw "EffectForce executable was not found!"
+          }
+
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+
+          Copy-Item $binary "dist/EffectForce.exe"
+
+          Compress-Archive `
+            -Path "dist/EffectForce.exe" `
+            -DestinationPath "dist/EffectForce-Windows-x64.zip" `
+            -Force
+
+      # Upload build artifacts
+      - name: Upload EffectForce Windows x64
+        uses: actions/upload-artifact@v4
+        with:
+          name: EffectForce-Windows-x64
+          path: dist/EffectForce-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
