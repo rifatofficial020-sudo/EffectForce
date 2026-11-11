@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500" width="100%" height="100%">
+  <!-- Outer Border -->
+  <rect x="48" y="48" width="404" height="404" rx="16" ry="16" fill="#b18ae3" />
+  
+  <!-- Inner Dark Background -->
+  <rect x="74" y="74" width="352" height="352" fill="#0d0426" />
+
+  <!-- "EF" Lettering -->
+  <g fill="#b88feb">
+    <!-- Letter E -->
+    <path d="M 131 163 h 121 v 41 h -79 v 44 h 70 v 40 h -70 v 47 h 79 v 41 h -121 z" />
+    
+    <!-- Letter F (shortened stem to match image) -->
+    <path d="M 287 163 h 121 v 41 h -79 v 44 h 70 v 40 h -70 v 88 h -42 z" />
+  </g>
+</svg>
