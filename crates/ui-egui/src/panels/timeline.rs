@@ -22,9 +22,7 @@ use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
 
-mod marquee;
-
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 enum RowKind {
     Layer,
     Group {
@@ -330,7 +328,7 @@ fn focus_expression(ctx: &egui::Context, prop: u64, select: [usize; 2]) {
     ctx.data_mut(|d| d.insert_temp(expr_focus_id(), ExprFocus { prop, select, pass }));
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 struct Row {
     layer: LayerId,
     depth: usize,
@@ -588,27 +586,15 @@ pub fn snap_time(candidates: &[f64], t: f64, tolerance: f64) -> f64 {
 
 /// Times the current-time indicator snaps to (comp seconds).
 fn snap_candidates(comp: &Comp, rows: &[Row]) -> Vec<f64> {
-    snap_targets(comp, rows, &[], false)
-}
-
-/// [`snap_candidates`] without the `edited` layers' In / Out points; when `moving` them, without
-/// their markers and keys either (those move along).
-fn snap_targets(comp: &Comp, rows: &[Row], edited: &[u64], moving: bool) -> Vec<f64> {
-    let skip = |l: LayerId, contents: bool| edited.contains(&l.0) && (moving || !contents);
     let mut v = vec![0.0, comp.work_area.0.seconds(), comp.work_area.1.seconds(), comp.duration.seconds()];
     v.extend(comp.markers.iter().map(|m| m.time.seconds()));
     for l in &comp.layers {
-        if !skip(l.id, false) {
-            v.push(l.in_point.seconds());
-            v.push(l.out_point.seconds());
-        }
-        if !skip(l.id, true) {
-            v.extend(l.markers.iter().map(|m| l.comp_time(m.time).seconds()));
-        }
+        v.push(l.in_point.seconds());
+        v.push(l.out_point.seconds());
+        v.extend(l.markers.iter().map(|m| l.comp_time(m.time).seconds()));
     }
     for r in rows {
         if let RowKind::Prop { uid } = r.kind
-            && !skip(r.layer, true)
             && let Some(l) = comp.layer(r.layer)
             && let Some(p) = l.props.find(uid)
         {
@@ -1790,7 +1776,19 @@ fn layout(app: &mut EffectcraftApp, ui: &egui::Ui, rect: Rect, cid: ItemId, comp
     let colhdr_h = 22.0;
     let footer_h = 24.0;
     let vis = Vis::of(&app.ui.timeline);
-    let left_w = (vis.fixed() + 190.0).clamp(420.0, (rect.width() * 0.72).max(420.0));
+
+    // The layer-list / time-graph divider is user-resizable. `columns_w` is
+    // already serialized by TimelineState, so the chosen width survives restarts.
+    const MIN_OUTLINE_WIDTH: f32 = 260.0;
+    const MIN_GRAPH_WIDTH: f32 = 200.0;
+    let max_outline_width =
+        (rect.width() - GUTTER_W - MIN_GRAPH_WIDTH).max(MIN_OUTLINE_WIDTH);
+    let left_w = app
+        .ui
+        .timeline
+        .columns_w
+        .clamp(MIN_OUTLINE_WIDTH, max_outline_width);
+    app.ui.timeline.columns_w = left_w;
     // Columns wider than the pane scroll horizontally (Shift+wheel / trackpad over the outline,
     // or the scroll bar above the footer); the name column keeps its minimum width.
     let natural_w = vis.fixed() + 190.0;
@@ -1950,7 +1948,108 @@ fn begin_rows(app: &mut EffectcraftApp, ui: &mut egui::Ui, tl: Tl) -> Rw {
 
 /// The Timeline panel for the active composition inside `rect`: draws the header, ruler, work
 /// area and cache bars, the layer rows with their switch and value cells, the time graph and its
-/// keys, and the footer; and turns this frame's clicks, drags and drops into commands. Without an
+/// keys, and the footer; and turns this frame's clicks, drags and drops into commands. A draggable
+/// divider separates the layer list from the time graph.
+///
+/// The starting width is kept in egui's temporary interaction data while dragging;
+/// the resulting width is written to `TimelineState::columns_w`, which is serialized.
+fn timeline_outline_splitter(app: &mut EffectcraftApp, ui: &mut egui::Ui, tl: &Tl) {
+    // Keep these limits identical to the values used by `layout()`.
+    const MIN_OUTLINE_WIDTH: f32 = 260.0;
+    const MIN_GRAPH_WIDTH: f32 = 200.0;
+    const HANDLE_WIDTH: f32 = 14.0;
+
+    // The interaction ID must be stable across frames. The drag offset is stored
+    // separately so grabbing either edge of the handle does not make the divider jump.
+    let splitter_id = ui.scope_id().with("timeline_outline_splitter");
+    let drag_offset_id = splitter_id.with("drag_pointer_offset");
+
+    let max_width = (tl.rect.width() - GUTTER_W - MIN_GRAPH_WIDTH)
+        .max(MIN_OUTLINE_WIDTH);
+    let current_width = app
+        .ui
+        .timeline
+        .columns_w
+        .clamp(MIN_OUTLINE_WIDTH, max_width);
+    let divider_x = tl.rect.min.x + current_width;
+
+    // Make the whole divider easy to grab, like the layer/time-panel divider in AE.
+    let handle_rect = Rect::from_min_max(
+        pos2(divider_x - HANDLE_WIDTH * 0.5, tl.rect.min.y),
+        pos2(divider_x + HANDLE_WIDTH * 0.5, tl.rect.max.y),
+    );
+    let response = ui.interact(handle_rect, splitter_id, Sense::click_and_drag());
+
+    if response.drag_started() {
+        if let Some(pointer_pos) = response.interact_pointer_pos() {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(drag_offset_id, divider_x - pointer_pos.x);
+            });
+        }
+    }
+
+    if response.dragged()
+        && let Some(pointer_pos) = response.interact_pointer_pos()
+    {
+        let pointer_offset = ui
+            .ctx()
+            .data(|data| data.get_temp::<f32>(drag_offset_id))
+            .unwrap_or(0.0);
+        // Use the pointer's absolute position rather than accumulating drag_delta.
+        // This avoids frame-rate-dependent movement and keeps the divider attached
+        // to the pointer for the entire drag.
+        let new_width = (pointer_pos.x + pointer_offset - tl.rect.min.x)
+            .clamp(MIN_OUTLINE_WIDTH, max_width);
+        if (app.ui.timeline.columns_w - new_width).abs() > 0.25 {
+            app.ui.timeline.columns_w = new_width;
+            ui.ctx().request_repaint();
+        }
+    }
+
+    if response.drag_stopped() {
+        ui.ctx().data_mut(|data| {
+            data.remove::<f32>(drag_offset_id);
+        });
+    }
+
+    let active = response.dragged();
+    let hovered = response.hovered();
+    let color = if active {
+        Color32::from_rgb(65, 155, 255)
+    } else if hovered {
+        Color32::from_rgb(155, 170, 190)
+    } else {
+        Color32::from_rgb(75, 85, 100)
+    };
+
+    let painter = ui.painter().with_clip_rect(tl.rect);
+    painter.line_segment(
+        [
+            pos2(divider_x, tl.rect.min.y),
+            pos2(divider_x, tl.rect.max.y),
+        ],
+        Stroke::new(if hovered || active { 2.0 } else { 1.0 }, color),
+    );
+
+    // Small grip marks make the resize affordance visible without adding a wide bar.
+    let grip_y = tl.rect.center().y;
+    for offset in [-7.0_f32, -3.5, 0.0, 3.5, 7.0] {
+        painter.line_segment(
+            [
+                pos2(divider_x - 2.0, grip_y + offset),
+                pos2(divider_x + 2.0, grip_y + offset),
+            ],
+            Stroke::new(1.0, color),
+        );
+    }
+
+    if hovered || active {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+
+    response.on_hover_text("Drag to resize the layer list and time graph");
+}
+
 /// active comp it shows a hint, and dropping footage on it creates a composition. Most edits
 /// use [`crate::menus::invoke`]; time, switch and work-area gestures call `Session::execute`
 /// directly and ignore errors. Reported failures go to `app.ui.status`. UI state (scroll, zoom,
@@ -1983,6 +2082,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     g.max_scroll = (total_h - g.rows_rect.height() + g.rh).max(0.0);
     g.rows = rows;
     reveal_scroll(app, g);
+    wheel_zoom_scroll(app, ui, g);
+    pick_whip_edge_scroll(app, g);
     let snap_project = app.session.project.clone();
     let snap_expr = app.session.expr.clone();
     let ectx = EvalCtx {
@@ -1998,10 +2099,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     };
     let mut rw = begin_rows(app, ui, tl);
     let g = &mut rw;
-    marquee::prepare(app, ui, g);
-    wheel_zoom_scroll(app, ui, &g.tl);
-    pick_whip_edge_scroll(app, &g.tl);
-    marquee::scroll(app, g);
     draw_rows(app, ui, g, &ectx);
     ui.set_clip_rect(g.full_clip);
     background_menus(app, ui, g);
@@ -2013,13 +2110,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     group_reorder_drag(ui, g);
     quick_offset_follow(g);
     key_drag_follow(app, g);
-    marquee::finish(app, ui, g);
+    box_select(app, ui, g);
     current_time_indicator(app, g);
     let footer = footer_bar(app, ui, g);
     footer_zoom(app, ui, g, footer);
     comp_markers_ui(app, ui, g);
     hand_tool_pan(app, ui, g);
     drop_targets(app, ui, g);
+    timeline_outline_splitter(app, ui, &rw.tl);
     let Rw { tl, ui_actions, .. } = rw;
     apply_ui_acts(app, &tl.comp, ui_actions);
     apply_actions(app, ui, &tl.ctx, tl.actions);
@@ -3485,85 +3583,44 @@ fn layer_quick_offset_begin(ui: &mut egui::Ui, g: &Rw, rc: &RowCtx<'_>, body: &e
     ctx.data(|d| d.get_temp::<QuickBar>(quick_bar_id())).is_some_and(|q| q.layer == layer.id)
 }
 
-/// One layer bar drag: the layers it edits, the pointer's travel (px), the grabbed layer's moving
-/// ends and the snap targets when it started (comp seconds), and the whole frames sent so far.
-#[derive(Clone)]
-struct BarDrag {
-    edited: Vec<u64>,
-    px: f64,
-    ends: Vec<f64>,
-    targets: Arc<[f64]>,
-    sent: i64,
-}
-
-/// The whole frames a bar drag of `px` moves its ends by: truncated as the pointer goes, or with
-/// `shift`, the move that puts one of `ends` on the nearest target within 8 px of the pointer
-/// (#1828). Measured from the pointer, never the snapped result, so dragging on lets go. The
-/// move stays whole frames, so an end off the frame grid lands within half a frame of its target.
-fn bar_drag_frames(px: f64, pps: f64, fd: f64, ends: &[f64], targets: &[f64], shift: bool) -> i64 {
-    let secs = px / pps;
-    let snapped = shift
-        .then(|| {
-            ends.iter()
-                .flat_map(|e| targets.iter().map(move |t| t - e))
-                .filter(|d| ((d - secs) * pps).abs() <= 8.0)
-                .min_by(|a, b| (a - secs).abs().total_cmp(&(b - secs).abs()))
-        })
-        .flatten();
-    // `as` saturates (NaN → 0), so a zero frame duration or zoom can't panic.
-    snapped.map_or((secs / fd).trunc() as i64, |d| (d / fd).round() as i64)
-}
-
-/// Moving and trimming a layer bar by whole frames; Shift snaps its ends to the current time,
-/// markers, keys, the work area and other layers' In / Out points, as in After Effects (#1828).
+/// Moving and trimming a layer bar by whole frames.
 fn layer_bar_drag(g: &mut Rw, rc: &RowCtx<'_>, bars: &BarResps, quick: bool) {
     let BarResps { body, lin, lout } = bars;
+    let pps = g.tl.pps;
+    let fd = g.tl.fd;
     let ctx = g.tl.ctx.clone();
+    let actions = &mut g.tl.actions;
+    let selected = &g.selected;
+    let ui_actions = &mut g.ui_actions;
     let layer = rc.layer;
     let drag_key = format!("bar-{}", layer.id.0);
     for (resp, kind) in [(&body, "move"), (&lin, "in"), (&lout, "out")] {
         if kind == "move" && quick {
             continue;
         }
-        let id = egui::Id::unique(("bar-drag", layer.id.0, kind));
         if resp.dragged() {
-            let shift = ctx.input(|i| i.modifiers.shift);
-            // Moving or trimming a selected layer acts on the whole selection as it is when the
-            // drag starts; each layer trims from its own in/out point. A Shift-drag on an
-            // unselected bar adds it to the selection (`layer_bar_hits`) and moves them all.
-            let start = || {
-                let mut edited = edited_layers(layer.id, &g.selected);
-                if kind == "move" && shift && !g.selected.contains(&layer.id) {
-                    edited.extend(g.selected.iter().map(|l| l.0));
-                }
-                let (i, o) = (layer.in_point.seconds(), layer.out_point.seconds());
-                let ends = match kind {
-                    "move" => vec![i, o],
-                    "in" => vec![i],
-                    _ => vec![o],
-                };
-                let mut targets = snap_targets(&g.tl.comp, &g.tl.rows, &edited, kind == "move");
-                targets.push(g.tl.time.seconds());
-                BarDrag { edited, px: 0.0, ends, targets: targets.into(), sent: 0 }
-            };
-            let mut drag = ctx.data(|d| d.get_temp::<BarDrag>(id)).filter(|_| !resp.drag_started()).unwrap_or_else(start);
-            drag.px += f64::from(resp.drag_delta().x);
-            let frames = bar_drag_frames(drag.px, g.tl.pps, g.tl.fd, &drag.ends, &drag.targets, shift);
-            if frames != drag.sent {
-                let d = frames.saturating_sub(drag.sent) as f64 * g.tl.fd;
-                drag.sent = frames;
+            let acc_id = egui::Id::unique(("bar-acc", layer.id.0, kind));
+            let mut acc: f32 = ctx.data(|d| d.get_temp(acc_id).unwrap_or(0.0));
+            acc += resp.drag_delta().x;
+            let frames = ((acc as f64 / pps) / fd).trunc() as i64;
+            if frames != 0 {
+                acc -= (frames as f64 * fd * pps) as f32;
+                let d = frames as f64 * fd;
+                // Moving or trimming a selected layer acts on the whole
+                // selection; each layer trims from its own in/out point.
+                let targets = json!(edited_layers(layer.id, selected));
                 let params = match kind {
-                    "move" => json!({"layers": drag.edited, "delta": d, "merge": drag_key}),
-                    "in" => json!({"layers": drag.edited, "inDelta": d, "merge": drag_key}),
-                    _ => json!({"layers": drag.edited, "outDelta": d, "merge": drag_key}),
+                    "move" => json!({"layers": targets, "delta": d, "merge": drag_key}),
+                    "in" => json!({"layers": targets, "inDelta": d, "merge": drag_key}),
+                    _ => json!({"layers": targets, "outDelta": d, "merge": drag_key}),
                 };
-                g.tl.actions.push(("layer.timing".into(), params));
+                actions.push(("layer.timing".into(), params));
             }
-            ctx.data_mut(|d| d.insert_temp(id, drag));
+            ctx.data_mut(|d| d.insert_temp(acc_id, acc));
         }
         if resp.drag_stopped() {
-            ctx.data_mut(|d| d.remove::<BarDrag>(id));
-            g.ui_actions.push(UiAct::EndMerge);
+            ctx.data_mut(|d| d.remove::<f32>(egui::Id::unique(("bar-acc", layer.id.0, kind))));
+            ui_actions.push(UiAct::EndMerge);
         }
     }
 }
@@ -4517,7 +4574,7 @@ fn background_menus(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: &mut Rw) {
     }
 }
 
-/// Click on the empty outline (its drag is the Timeline's one box, [`marquee`]).
+/// Click on the empty outline (its drag is the Timeline's one box, [`box_select`]).
 fn outline_marquee(ui: &mut egui::Ui, g: &mut Rw) {
     let actions = &mut g.tl.actions;
     let outline_empty = g.outline_empty.clone();
@@ -4635,7 +4692,7 @@ fn alt_scale_and_graph(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: &mut Rw, 
     // below the last row) deselects the layers and their keys and properties, as in After
 }
 
-/// Click on empty track area (its drag is the Timeline's one box, [`marquee`]).
+/// Click on empty track area (its drag is the Timeline's one box, [`box_select`]).
 fn graph_empty_area(ui: &mut egui::Ui, g: &mut Rw) {
     let actions = &mut g.tl.actions;
     let empty = g.empty.clone();
@@ -4852,6 +4909,80 @@ fn keys_in_box(comp: &Comp, rows: &[Row], tm: &TMap, top: f32, rh: f32, br: Rect
         }
     }
     keys
+}
+
+/// What a box over the Timeline selects: the layer rows it crosses (locked layers stay out) and
+/// the keys whose markers it touches. A box that reaches the outline (started on either side)
+/// selects the rows it crosses; one kept inside the time graph selects keys only, as before.
+/// Keys exist only in the time graph, so the box is cut at its left edge (`graph_x0`; a key
+/// scrolled out under the outline isn't touched).
+/// `graph_on`: the Graph Editor shows no key markers here.
+#[allow(clippy::too_many_arguments)]
+fn box_targets(
+    comp: &Comp,
+    rows: &[Row],
+    hit_rows: &[(Rect, Row)],
+    tm: &TMap,
+    top: f32,
+    rh: f32,
+    graph_x0: f32,
+    graph_on: bool,
+    br: Rect,
+) -> (Vec<u64>, Vec<effectcraft_engine::KeyRef>) {
+    let layers = hit_rows
+        .iter()
+        .filter(|(r, row)| br.min.x < graph_x0 && matches!(row.kind, RowKind::Layer) && r.intersects(br))
+        .filter(|(_, row)| comp.layer(row.layer).is_some_and(|l| !l.switches.locked))
+        .map(|(_, row)| row.layer.0)
+        .collect();
+    let in_graph = Rect::from_min_max(pos2(br.min.x.max(graph_x0), br.min.y), pos2(br.max.x, br.max.y));
+    let keys = if graph_on || in_graph.width() < 0.0 { vec![] } else { keys_in_box(comp, rows, tm, top, rh, in_graph) };
+    (layers, keys)
+}
+
+/// The Timeline's one selection box, from the empty outline or the empty time graph: it spans both
+/// columns as it is dragged (the pointer may cross the boundary either way) and on release selects
+/// the layer rows it crosses and the keys inside it, as in After Effects.
+fn box_select(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: &mut Rw) {
+    let t = g.tl.t;
+    let tm = g.tl.tm;
+    let rows_rect = g.tl.rows_rect;
+    let rh = g.tl.rh;
+    let graph_x0 = g.tl.graph_x0;
+    let graph_on = g.graph_on;
+    let ctx = g.tl.ctx.clone();
+    let comp = g.tl.comp.clone();
+    let rows = g.tl.rows.clone();
+    let origin = [&g.outline_empty, &g.empty].into_iter().find(|r| r.dragged() || r.drag_stopped()).cloned();
+    let Some(origin) = origin else { return };
+    let box_of = |o: &egui::Response| {
+        let start = ctx.input(|i| i.pointer.press_origin());
+        start.zip(o.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.latest_pos()))).map(|(a, b)| Rect::from_two_pos(a, b).intersect(rows_rect))
+    };
+    let id = egui::Id::unique("tl-box");
+    if origin.dragged()
+        && let Some(br) = box_of(&origin)
+    {
+        let bp = g.tl.p.with_clip_rect(rows_rect);
+        bp.rect_filled(br, 0.0, t.accent.gamma_multiply(0.12));
+        bp.rect_stroke(br, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+        ctx.data_mut(|d| d.insert_temp(id, br));
+    }
+    if origin.drag_stopped()
+        && let Some(br) = ctx.data(|d| d.get_temp::<Rect>(id))
+    {
+        ctx.data_mut(|d| d.remove::<Rect>(id));
+        let (layers, touched) = box_targets(&comp, &rows, &g.hit_rows, &tm, rows_rect.min.y - app.ui.timeline.scroll_y, rh, graph_x0, graph_on, br);
+        let mods = ui.input(|i| i.modifiers);
+        let add = mods.shift || mods.command;
+        let actions = &mut g.tl.actions;
+        // A box that catches nothing leaves nothing selected (layers included), unless it adds.
+        actions.push(("layer.select".into(), json!({"layers": layers, "add": add})));
+        if !touched.is_empty() {
+            let keys: Vec<serde_json::Value> = touched.iter().map(|k| json!({"layer": k.layer.0, "prop": k.prop, "time": k.time.seconds()})).collect();
+            actions.push(("keys.select".into(), json!({"keys": keys, "add": true, "selectProperties": true})));
+        }
+    }
 }
 
 fn current_time_indicator(app: &mut EffectcraftApp, g: &Rw) {
